@@ -43,6 +43,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Architecture overview document (#160).
 - Troubleshooting guide (#158).
 - Migration guide (`docs/migration.md`) for users coming from
+- `config diff --summary` — print a single-line summary
+  (`X pricing changes, Y non-pricing changes`) instead of the full diff, for CI
+  status lines. Exit code and auto-save side effects are unchanged.
+- `CHANGELOG.md` following the Keep a Changelog format.
+- `docs/migration.md` — migration guide for users coming from
   `stellar contract invoke --cost`.
 - End-to-end integration tests covering every CLI command, its flags, and
   its offline error paths.

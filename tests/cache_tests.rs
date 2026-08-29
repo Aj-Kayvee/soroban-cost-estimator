@@ -297,8 +297,320 @@ fn test_verify_cache_ignores_non_json_files() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────
-// Concurrency
+// Cross-network cache isolation
 // ─────────────────────────────────────────────────────────────────────────
+
+/// Saving the same key (wasm_hash + function + args) on two different
+/// networks overwrites the previous entry.  This documents the current
+/// behaviour so any future fix can be detected by these tests.
+#[test]
+fn test_same_key_different_networks_overwrites_previous() {
+    with_temp_home(|_tmp| {
+        // First write: testnet, ledger 10
+        cache::save_estimate(
+            "hash1",
+            "func1",
+            &["arg".to_string()],
+            "testnet",
+            10,
+            100,
+            10,
+            5,
+        )
+        .expect("save testnet");
+
+        let loaded = cache::load_estimate("hash1", "func1", &["arg".to_string()])
+            .expect("load")
+            .expect("should exist");
+        assert_eq!(loaded.network, "testnet");
+        assert_eq!(loaded.ledger, 10);
+
+        // Second write: mainnet, same key, ledger 20
+        cache::save_estimate(
+            "hash1",
+            "func1",
+            &["arg".to_string()],
+            "mainnet",
+            20,
+            200,
+            20,
+            10,
+        )
+        .expect("save mainnet");
+
+        // The testnet entry is gone — the file was overwritten.
+        let loaded = cache::load_estimate("hash1", "func1", &["arg".to_string()])
+            .expect("load")
+            .expect("should still exist");
+        assert_eq!(
+            loaded.network, "mainnet",
+            "mainnet should have overwritten testnet"
+        );
+        assert_eq!(loaded.ledger, 20);
+
+        // list_cached_estimates confirms the leak.
+        let testnet = cache::list_cached_estimates("testnet").expect("list");
+        assert!(
+            testnet.is_empty(),
+            "testnet should have no entries after overwrite"
+        );
+        let mainnet = cache::list_cached_estimates("mainnet").expect("list");
+        assert_eq!(mainnet.len(), 1);
+    });
+}
+
+/// When different networks use distinct wasm_hash + function + args keys,
+/// each network's estimates are fully isolated.
+#[test]
+fn test_different_keys_different_networks_are_isolated() {
+    with_temp_home(|_tmp| {
+        cache::save_estimate(
+            "hashA",
+            "funcA",
+            &["a1".to_string()],
+            "testnet",
+            1,
+            100,
+            10,
+            5,
+        )
+        .expect("testnet A");
+        cache::save_estimate(
+            "hashB",
+            "funcB",
+            &["b1".to_string()],
+            "mainnet",
+            2,
+            200,
+            20,
+            10,
+        )
+        .expect("mainnet B");
+        cache::save_estimate(
+            "hashC",
+            "funcC",
+            &["c1".to_string()],
+            "futurenet",
+            3,
+            300,
+            30,
+            15,
+        )
+        .expect("futurenet C");
+
+        let tn = cache::list_cached_estimates("testnet").expect("list testnet");
+        assert_eq!(tn.len(), 1);
+        assert_eq!(tn[0].function, "funcA");
+        assert_eq!(tn[0].network, "testnet");
+
+        let mn = cache::list_cached_estimates("mainnet").expect("list mainnet");
+        assert_eq!(mn.len(), 1);
+        assert_eq!(mn[0].function, "funcB");
+        assert_eq!(mn[0].network, "mainnet");
+
+        let fn_ = cache::list_cached_estimates("futurenet").expect("list futurenet");
+        assert_eq!(fn_.len(), 1);
+        assert_eq!(fn_[0].function, "funcC");
+        assert_eq!(fn_[0].network, "futurenet");
+    });
+}
+
+/// load_estimate does not filter by network — it returns whatever the file
+/// contains.  This test documents that cross-network calls return the
+/// *stored* network, even if the caller intended a different one.
+#[test]
+fn test_load_estimate_returns_stored_network_not_caller_network() {
+    with_temp_home(|_tmp| {
+        // Save on testnet
+        cache::save_estimate("hash", "fn", &["x".to_string()], "testnet", 10, 100, 10, 5)
+            .expect("save");
+
+        // load_estimate has no network parameter — it returns whatever was saved.
+        let loaded = cache::load_estimate("hash", "fn", &["x".to_string()])
+            .expect("load")
+            .expect("should exist");
+        assert_eq!(loaded.network, "testnet");
+    });
+}
+
+/// Multiple networks with the same wasm_hash and function but different args
+/// should not leak — the args hash isolates them.
+#[test]
+fn test_same_wasm_function_different_args_different_networks_isolated() {
+    with_temp_home(|_tmp| {
+        cache::save_estimate(
+            "hash",
+            "func",
+            &["arg-tn".to_string()],
+            "testnet",
+            1,
+            100,
+            10,
+            5,
+        )
+        .expect("testnet save");
+        cache::save_estimate(
+            "hash",
+            "func",
+            &["arg-mn".to_string()],
+            "mainnet",
+            2,
+            200,
+            20,
+            10,
+        )
+        .expect("mainnet save");
+
+        let tn = cache::load_estimate("hash", "func", &["arg-tn".to_string()])
+            .expect("load tn")
+            .expect("should exist");
+        assert_eq!(tn.network, "testnet");
+        assert_eq!(tn.ledger, 1);
+
+        let mn = cache::load_estimate("hash", "func", &["arg-mn".to_string()])
+            .expect("load mn")
+            .expect("should exist");
+        assert_eq!(mn.network, "mainnet");
+        assert_eq!(mn.ledger, 2);
+
+        // Both still appear under their respective network lists.
+        assert_eq!(cache::list_cached_estimates("testnet").unwrap().len(), 1);
+        assert_eq!(cache::list_cached_estimates("mainnet").unwrap().len(), 1);
+    });
+}
+
+/// find_stale_estimates must not mix networks — stale entries from one
+/// network must not appear when querying another.
+#[test]
+fn test_find_stale_estimates_does_not_mix_networks() {
+    with_temp_home(|_tmp| {
+        // testnet: ledger 5 (stale at ledger 10)
+        cache::save_estimate("h", "f-tn", &[], "testnet", 5, 100, 10, 5).expect("tn");
+        // mainnet: ledger 12 (NOT stale at ledger 10)
+        cache::save_estimate("h", "f-mn", &[], "mainnet", 12, 200, 20, 10).expect("mn");
+
+        let tn_all = cache::list_cached_estimates("testnet").expect("list tn");
+        let tn_stale = cache::find_stale_estimates(&tn_all, 10);
+        assert_eq!(tn_stale.len(), 1, "testnet ledger 5 should be stale at 10");
+        assert_eq!(tn_stale[0].network, "testnet");
+
+        let mn_all = cache::list_cached_estimates("mainnet").expect("list mn");
+        let mn_stale = cache::find_stale_estimates(&mn_all, 10);
+        assert!(
+            mn_stale.is_empty(),
+            "mainnet ledger 12 should not be stale at 10"
+        );
+    });
+}
+
+/// verify_cache must report entries from every network as valid, and not
+/// leak network information across files.
+#[test]
+fn test_verify_cache_across_networks_all_valid() {
+    with_temp_home(|_tmp| {
+        cache::save_estimate("h1", "f1", &[], "testnet", 1, 100, 10, 5).expect("tn");
+        cache::save_estimate("h2", "f2", &[], "mainnet", 2, 200, 20, 10).expect("mn");
+        cache::save_estimate("h3", "f3", &[], "futurenet", 3, 300, 30, 15).expect("fn");
+
+        let statuses = cache::verify_cache().expect("verify");
+        assert_eq!(statuses.len(), 3, "all three entries should be verified");
+        assert!(
+            statuses.iter().all(|s| s.valid),
+            "all entries should be valid"
+        );
+    });
+}
+
+/// Concurrent saves from two different networks to the same key must leave
+/// a valid entry behind — no torn writes, no corruption.
+#[test]
+fn test_concurrent_cross_network_same_key_no_corruption() {
+    with_temp_home(|_tmp| {
+        let args = vec!["shared".to_string()];
+        let tn_args = args.clone();
+        let mn_args = args.clone();
+
+        let tn = std::thread::spawn(move || {
+            cache::save_estimate(
+                "shared-hash",
+                "shared-func",
+                &tn_args,
+                "testnet",
+                1,
+                100,
+                10,
+                5,
+            )
+            .expect("concurrent testnet save");
+        });
+        let mn = std::thread::spawn(move || {
+            cache::save_estimate(
+                "shared-hash",
+                "shared-func",
+                &mn_args,
+                "mainnet",
+                2,
+                200,
+                20,
+                10,
+            )
+            .expect("concurrent mainnet save");
+        });
+
+        tn.join().expect("testnet thread panicked");
+        mn.join().expect("mainnet thread panicked");
+
+        // The surviving entry must be valid JSON.
+        let loaded = cache::load_estimate("shared-hash", "shared-func", &args)
+            .expect("load")
+            .expect("shared key should exist");
+        assert!(
+            loaded.network == "testnet" || loaded.network == "mainnet",
+            "surviving entry must be from one of the two networks: {loaded:?}"
+        );
+
+        let statuses = cache::verify_cache().expect("verify");
+        assert_eq!(statuses.len(), 1, "one entry for the shared key");
+        assert!(statuses[0].valid, "entry must be valid: {statuses:?}");
+    });
+}
+
+/// Load after cross-network overwrite must return the latest writer's data,
+/// not the first writer's. This is the "leak" scenario: a testnet cache
+/// entry is silently replaced by a mainnet write.
+#[test]
+fn test_load_after_cross_network_overwrite_returns_latest_writer() {
+    with_temp_home(|_tmp| {
+        cache::save_estimate("h", "f", &["x".to_string()], "testnet", 100, 1000, 100, 50)
+            .expect("save testnet");
+
+        let before = cache::load_estimate("h", "f", &["x".to_string()])
+            .unwrap()
+            .unwrap();
+        assert_eq!(before.network, "testnet");
+        assert_eq!(before.ledger, 100);
+
+        // Overwrite with mainnet
+        cache::save_estimate("h", "f", &["x".to_string()], "mainnet", 200, 2000, 200, 100)
+            .expect("save mainnet");
+
+        let after = cache::load_estimate("h", "f", &["x".to_string()])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.network, "mainnet",
+            "should return mainnet after overwrite"
+        );
+        assert_eq!(after.ledger, 200);
+
+        // Verify the testnet list is now empty for this key.
+        let tn = cache::list_cached_estimates("testnet").unwrap();
+        assert!(
+            tn.is_empty(),
+            "testnet list should be empty after mainnet overwrite"
+        );
+    });
+}
 
 /// Concurrent `save_estimate`/`load_estimate` calls on distinct cache keys
 /// must not corrupt the cache.
@@ -823,5 +1135,209 @@ fn test_load_fresh_estimate_expired_returns_none() {
         )
         .expect("load fresh");
         assert!(fresh.is_none(), "an expired entry must yield None");
+    });
+}
+
+/// Set a cache entry file's modification time, used to control LRU ordering
+/// in eviction tests.
+fn set_cache_file_mtime(tmp: &Path, wasm_hash: &str, function: &str, args: &[&str], age: u64) {
+    let mut hasher = sha2::Sha256::new();
+    for arg in args {
+        hasher.update(arg.as_bytes());
+    }
+    let args_hash = hex::encode(hasher.finalize());
+    let dir = tmp.join(".soroban-cost-estimator").join("cache");
+    let path = dir.join(format!("{wasm_hash}-{function}-{args_hash}.json"));
+    let file = std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .expect("open cache file");
+    let mtime = std::time::SystemTime::now() - std::time::Duration::from_secs(age);
+    file.set_modified(mtime).expect("set mtime");
+}
+
+/// `cache_size_bytes` reports 0 for an empty cache and grows as entries are
+/// added.
+#[test]
+fn test_cache_size_bytes_tracks_entries() {
+    with_temp_home(|tmp| {
+        assert_eq!(
+            cache::cache_size_bytes().expect("empty cache size"),
+            0,
+            "empty cache must measure 0 bytes"
+        );
+
+        cache::save_estimate("h1", "f1", &["a".to_string()], "testnet", 1, 100, 10, 5)
+            .expect("save first");
+        let after_one = cache::cache_size_bytes().expect("size after one");
+        assert!(after_one > 0, "one entry must be measurable");
+
+        cache::save_estimate("h2", "f2", &["b".to_string()], "testnet", 1, 100, 10, 5)
+            .expect("save second");
+        let after_two = cache::cache_size_bytes().expect("size after two");
+        assert!(
+            after_two > after_one,
+            "second entry must grow the measured size"
+        );
+        let _ = tmp;
+    });
+}
+
+/// `evict_lru_entries` removes the least-recently-used entries first when
+/// the cache exceeds the limit, and stops once it fits.
+#[test]
+fn test_evict_lru_entries_evicts_oldest_first() {
+    with_temp_home(|tmp| {
+        // Three distinct entries; `write_raw_entry` writes them in quick
+        // succession so their mtimes are nearly identical. Force distinct
+        // ages to make LRU order deterministic.
+        write_raw_entry(tmp, "h_old", "f_old", &["old"], None, 1);
+        write_raw_entry(tmp, "h_mid", "f_mid", &["mid"], None, 1);
+        write_raw_entry(tmp, "h_new", "f_new", &["new"], None, 1);
+        set_cache_file_mtime(tmp, "h_old", "f_old", &["old"], 300);
+        set_cache_file_mtime(tmp, "h_mid", "f_mid", &["mid"], 200);
+        set_cache_file_mtime(tmp, "h_new", "f_new", &["new"], 100);
+
+        let total = cache::cache_size_bytes().expect("total size");
+
+        // Entries are uniform in size, so a limit of total/3 fits exactly
+        // one entry: the two older entries must be evicted.
+        let evicted = cache::evict_lru_entries(total / 3, None).expect("evict");
+        assert_eq!(evicted, 2, "exactly the two oldest entries evicted");
+
+        assert!(
+            cache::load_estimate("h_old", "f_old", &["old".to_string()])
+                .expect("load old")
+                .is_none(),
+            "oldest entry must be evicted"
+        );
+        assert!(
+            cache::load_estimate("h_mid", "f_mid", &["mid".to_string()])
+                .expect("load mid")
+                .is_none(),
+            "second-oldest entry must be evicted"
+        );
+        assert!(
+            cache::load_estimate("h_new", "f_new", &["new".to_string()])
+                .expect("load new")
+                .is_some(),
+            "newest entry must survive"
+        );
+        let _ = tmp;
+    });
+}
+
+/// `evict_lru_entries` never evicts the protected entry, even when it is the
+/// least-recently-used file on disk.
+#[test]
+fn test_evict_lru_entries_respects_protected() {
+    with_temp_home(|tmp| {
+        write_raw_entry(tmp, "h_old", "f_old", &["old"], None, 1);
+        write_raw_entry(tmp, "h_new", "f_new", &["new"], None, 1);
+        set_cache_file_mtime(tmp, "h_old", "f_old", &["old"], 300);
+        set_cache_file_mtime(tmp, "h_new", "f_new", &["new"], 100);
+
+        let dir = tmp.join(".soroban-cost-estimator").join("cache");
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(b"old");
+        let args_hash = hex::encode(hasher.finalize());
+        let protected_path = dir.join(format!("h_old-f_old-{args_hash}.json"));
+
+        // Limit fits only one entry; the protected (oldest) one must be
+        // spared, so the newer entry is evicted instead.
+        let total = cache::cache_size_bytes().expect("total size");
+        let evicted = cache::evict_lru_entries(total - 1, Some(&protected_path))
+            .expect("evict with protection");
+        assert_eq!(evicted, 1);
+
+        assert!(
+            cache::load_estimate("h_old", "f_old", &["old".to_string()])
+                .expect("load protected")
+                .is_some(),
+            "protected entry must survive eviction"
+        );
+        assert!(
+            cache::load_estimate("h_new", "f_new", &["new".to_string()])
+                .expect("load new")
+                .is_none(),
+            "non-protected entry must be evicted"
+        );
+        let _ = tmp;
+    });
+}
+
+/// Loading an entry refreshes its recency: a read bumps the file mtime, so
+/// a just-read (older) entry survives eviction over an unread newer one.
+#[test]
+fn test_load_refreshes_recency_for_lru() {
+    with_temp_home(|tmp| {
+        write_raw_entry(tmp, "h_old", "f_old", &["old"], None, 1);
+        write_raw_entry(tmp, "h_new", "f_new", &["new"], None, 1);
+        set_cache_file_mtime(tmp, "h_old", "f_old", &["old"], 300);
+        set_cache_file_mtime(tmp, "h_new", "f_new", &["new"], 100);
+
+        // Reading the older entry must make it the most-recently-used one.
+        assert!(
+            cache::load_estimate("h_old", "f_old", &["old".to_string()])
+                .expect("load old")
+                .is_some(),
+            "old entry should load"
+        );
+
+        // Only one entry fits: the one that was just read survives.
+        let total = cache::cache_size_bytes().expect("total size");
+        let evicted = cache::evict_lru_entries(total / 2, None).expect("evict");
+        assert_eq!(evicted, 1, "one entry evicted");
+
+        assert!(
+            cache::load_estimate("h_old", "f_old", &["old".to_string()])
+                .expect("load old again")
+                .is_some(),
+            "just-read entry must survive eviction"
+        );
+        assert!(
+            cache::load_estimate("h_new", "f_new", &["new".to_string()])
+                .expect("load new")
+                .is_none(),
+            "unread entry must be evicted"
+        );
+        let _ = tmp;
+    });
+}
+
+/// The eviction path stays healthy with many entries in the cache: saving
+/// several estimates then enforcing a tight limit evicts the oldest and
+/// keeps the newest readable through the public API.
+#[test]
+fn test_save_estimate_then_evict_keeps_newest() {
+    with_temp_home(|tmp| {
+        for i in 0..5 {
+            let key = format!("h{i}");
+            let fkey = format!("f{i}");
+            cache::save_estimate(&key, &fkey, &["x".to_string()], "testnet", 1, 100, 10, 5)
+                .expect("save estimate");
+            set_cache_file_mtime(tmp, &key, &fkey, &["x"], 300 - i * 50);
+        }
+
+        // Entries are uniform in size, so a limit of total/5 fits exactly
+        // one entry: the four older entries must be evicted.
+        let total = cache::cache_size_bytes().expect("total size");
+        let evicted = cache::evict_lru_entries(total / 5, None).expect("evict");
+        assert_eq!(evicted, 4, "four oldest entries evicted");
+
+        // The newest estimate is still loadable after eviction.
+        assert!(
+            cache::load_estimate("h4", "f4", &["x".to_string()])
+                .expect("load newest")
+                .is_some(),
+            "newest entry must survive eviction"
+        );
+        assert!(
+            cache::load_estimate("h0", "f0", &["x".to_string()])
+                .expect("load oldest")
+                .is_none(),
+            "oldest entry must be evicted"
+        );
+        let _ = tmp;
     });
 }
