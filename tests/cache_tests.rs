@@ -37,15 +37,17 @@ where
     std::fs::create_dir_all(&tmp).expect("create temp home");
 
     let old_home = std::env::var_os("HOME");
-    // SAFETY: serialized by HOME_MUTEX, no other thread reads HOME during this block
+    let old_userprofile = std::env::var_os("USERPROFILE");
+    // SAFETY: serialized by HOME_MUTEX, no other thread reads these vars during this block
     unsafe {
         std::env::set_var("HOME", &tmp);
+        std::env::set_var("USERPROFILE", &tmp);
     }
 
     // Run the test; catch panics so we can clean up regardless
     let result = std::panic::catch_unwind(|| {
         // Verify the cache dir resolves inside the temp dir
-        let home = dirs::home_dir().expect("home dir");
+        let home = soroban_cost_estimator::home_dir().expect("home dir");
         assert!(
             home.starts_with(&tmp),
             "HOME should point to temp dir: {} vs {}",
@@ -55,16 +57,9 @@ where
         test(&tmp);
     });
 
-    // SAFETY: serialized by HOME_MUTEX, no other thread reads HOME during this block
-    if let Some(old) = old_home {
-        unsafe {
-            std::env::set_var("HOME", old);
-        }
-    } else {
-        unsafe {
-            std::env::remove_var("HOME");
-        }
-    }
+    // SAFETY: serialized by HOME_MUTEX, no other thread reads these vars during this block
+    restore_env("HOME", old_home);
+    restore_env("USERPROFILE", old_userprofile);
 
     // Clean up temp dir
     let _ = std::fs::remove_dir_all(&tmp);
@@ -74,6 +69,17 @@ where
 
     if let Err(e) = result {
         std::panic::resume_unwind(e);
+    }
+}
+
+/// Restore an environment variable to its prior value (or remove it).
+fn restore_env(key: &str, value: Option<std::ffi::OsString>) {
+    // SAFETY: called under HOME_MUTEX, no other thread reads these vars concurrently
+    unsafe {
+        match value {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
     }
 }
 
