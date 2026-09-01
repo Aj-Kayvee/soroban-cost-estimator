@@ -44,6 +44,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Troubleshooting guide (#158).
 - Migration guide (`docs/migration.md`) for users coming from
   `stellar contract invoke --cost`.
+- `--timeout` global flag — configurable HTTP request timeout for RPC calls
+  in seconds (default 30).
 - `config diff --summary` — print a single-line summary
   (`X pricing changes, Y non-pricing changes`) instead of the full diff, for CI
   status lines. Exit code and auto-save side effects are unchanged.
@@ -61,6 +63,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Refactored main CLI loop to extract config snapshot fetching and stale-
   estimate printing into dedicated helpers (#151).
+- End-to-end integration tests in `tests/cli_tests.rs` covering every CLI
+  command, its flags, and its offline error paths.
+- CI build matrix running fmt, clippy, build, and tests on Linux, macOS, and
+  Windows for cross-platform compatibility.
 
 ## [0.1.0] - 2026-08-13
 
