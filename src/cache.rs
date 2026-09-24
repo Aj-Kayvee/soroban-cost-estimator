@@ -717,6 +717,65 @@ pub fn verify_cache() -> AppResult<Vec<CacheEntryStatus>> {
     Ok(statuses)
 }
 
+/// Aggregate statistics for the estimate cache.
+#[derive(Debug, Clone)]
+pub struct CacheStats {
+    /// Total number of cached estimates across all networks.
+    pub total_entries: usize,
+    /// Disk usage of the SQLite database file in bytes.
+    pub disk_bytes: u64,
+    /// Timestamp of the oldest entry (ISO-8601), if any.
+    pub oldest_entry: Option<String>,
+    /// Timestamp of the newest entry (ISO-8601), if any.
+    pub newest_entry: Option<String>,
+    /// Per-network breakdown: (network, count).
+    pub per_network: Vec<(String, usize)>,
+}
+
+/// Compute aggregate cache statistics.
+///
+/// Reads the SQLite database metadata (file size) and queries the
+/// `estimates` table for total count, timestamp bounds, and a
+/// `GROUP BY network` breakdown.
+///
+/// # Network calls
+/// None — pure SQLite I/O.
+pub fn cache_stats() -> AppResult<CacheStats> {
+    let path = db_path()?;
+    let disk_bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+
+    let conn = open_db()?;
+
+    // Total count.
+    let total_entries: usize =
+        conn.query_row("SELECT COUNT(*) FROM estimates", [], |row| row.get(0))?;
+
+    // Oldest and newest timestamps.
+    let oldest_entry: Option<String> = conn
+        .query_row("SELECT MIN(timestamp) FROM estimates", [], |row| row.get(0))
+        .ok();
+    let newest_entry: Option<String> = conn
+        .query_row("SELECT MAX(timestamp) FROM estimates", [], |row| row.get(0))
+        .ok();
+
+    // Per-network breakdown.
+    let mut stmt = conn.prepare(
+        "SELECT network, COUNT(*) FROM estimates GROUP BY network ORDER BY COUNT(*) DESC",
+    )?;
+    let per_network: Vec<(String, usize)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    debug!(total_entries, disk_bytes, "cache stats computed");
+    Ok(CacheStats {
+        total_entries,
+        disk_bytes,
+        oldest_entry,
+        newest_entry,
+        per_network,
+    })
+}
+
 /// Check which cached estimates are now stale (simulated at an earlier ledger).
 ///
 /// Returns a list of cached estimates that were made before `current_ledger`.
@@ -771,6 +830,26 @@ fn save_registry(registry: &WasmRegistry) -> AppResult<()> {
     let json = serde_json::to_string_pretty(registry)?;
     std::fs::write(&path, json)?;
     Ok(())
+}
+
+/// Delete every cached estimate recorded for the given network.
+///
+/// Returns the number of rows deleted. Entries for other networks are left
+/// untouched. This is the single shared implementation behind both the
+/// `cache clear` subcommand and the `estimate --clear-cache` flag, so the
+/// two paths behave identically.
+///
+/// # Network calls
+/// None — pure SQLite I/O.
+pub fn clear_cache(network: &str) -> AppResult<usize> {
+    let _guard = WRITE_LOCK
+        .lock()
+        .map_err(|e| AppError::General(format!("cache write lock poisoned: {e}")))?;
+    let conn = open_db()?;
+    let removed =
+        execute_with_retry(|| conn.execute("DELETE FROM estimates WHERE network = ?1", [network]))?;
+    debug!(network, removed, "cache cleared");
+    Ok(removed)
 }
 
 /// Remove every cached estimate produced from the given WASM hash.
