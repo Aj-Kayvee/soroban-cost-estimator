@@ -42,8 +42,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Comprehensive command reference documentation page (#162).
 - Architecture overview document (#160).
 - Troubleshooting guide (#158).
-- Migration guide (`docs/migration.md`) for users coming from
-  `stellar contract invoke --cost`.
 - `--timeout` global flag — configurable HTTP request timeout for RPC calls
   in seconds (default 30).
 - `config diff --summary` — print a single-line summary
